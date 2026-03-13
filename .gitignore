@@ -1,0 +1,20 @@
+# types de fichiers
+__pycache__/
+.env
+node_modules/
+*.log
+
+# dossier
+.claude/
+venv_trash/
+docs/
+data/
+thesis/
+venv/
+models/
+checkpoints/
+
+# fichiers
+resume_fr.md
+CLAUDE.md
+implementation_plan.md

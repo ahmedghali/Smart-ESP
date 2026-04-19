@@ -158,12 +158,114 @@ class ESPSimulator:
         # Time tracking
         self.time_step = 1.0  # hours
         self.current_time = 0.0
+
+        # Active fault scenario (None = normal)
+        self.active_fault = None
     
     def reset(self) -> ESPState:
         """Reset simulator to initial state."""
         self.state = ESPState()
         self.current_time = 0.0
+        self.active_fault = None
         return self.state
+
+    VALID_FAULTS = (
+        "motor_overheat", "sand_ingestion", "bearing_wear", "voltage_drop",
+        "gas_lock", "plugged_choke", "shaft_imbalance", "reservoir_depletion",
+    )
+
+    def inject_fault(self, fault_type: str) -> None:
+        """
+        Inject a persistent fault scenario.
+
+        The fault stays active (modifying each subsequent step) until
+        clear_fault() or reset() is called. Initial damage is applied to
+        health variables to reflect accumulated wear.
+
+        Args:
+            fault_type: One of VALID_FAULTS.
+        """
+        if fault_type not in self.VALID_FAULTS:
+            raise ValueError(f"Unknown fault type: {fault_type}")
+
+        self.active_fault = fault_type
+        s = self.state
+
+        # One-time health damage (persists even after clear_fault)
+        if fault_type == "motor_overheat":
+            s.motor_health = max(0.3, s.motor_health - 0.25)
+        elif fault_type == "sand_ingestion":
+            s.shaft_health = max(0.35, s.shaft_health - 0.2)
+        elif fault_type == "bearing_wear":
+            s.bearing_health = min(s.bearing_health, 0.25)
+        elif fault_type == "shaft_imbalance":
+            s.shaft_health = max(0.30, s.shaft_health - 0.35)
+
+        # Apply immediate effects so UI reacts even before next step()
+        self._apply_active_fault_effects()
+        self._update_status()
+
+    def clear_fault(self) -> None:
+        """Clear the active fault (health damage is not reversed)."""
+        self.active_fault = None
+        self.reservoir_pressure = 2500.0
+        self.gas_oil_ratio = 150.0
+
+    def _apply_active_fault_effects(self) -> None:
+        """
+        Continuously enforce active-fault symptoms on the state.
+        Called from step() so the fault remains visible across iterations.
+        """
+        if not self.active_fault:
+            return
+
+        s = self.state
+        ft = self.active_fault
+
+        if ft == "motor_overheat":
+            s.motor_temperature = max(s.motor_temperature,
+                                      140.0 + np.random.uniform(0, 6))
+            s.fluid_temperature = max(s.fluid_temperature, 90.0)
+
+        elif ft == "sand_ingestion":
+            s.sand_rate = max(s.sand_rate, 0.7 + np.random.uniform(0, 0.15))
+            s.vibration_x += 3.5
+            s.vibration_y += 3.0
+            s.vibration_z += 2.5
+            s.shaft_health = max(0.1, s.shaft_health - 0.0008)
+
+        elif ft == "bearing_wear":
+            s.bearing_health = min(s.bearing_health, 0.25)
+            s.vibration_z += 5.0
+            s.motor_temperature += 10.0
+
+        elif ft == "voltage_drop":
+            s.voltage = 380.0 + np.random.normal(0, 3)
+            s.power_factor = min(s.power_factor, 0.72)
+            s.motor_current += 22.0
+
+        elif ft == "gas_lock":
+            self.gas_oil_ratio = 800.0
+            s.flow_rate *= 0.35
+            s.discharge_pressure *= 0.55
+            s.vibration_x += 2.0
+            s.intake_pressure += float(np.random.normal(0, 40))
+
+        elif ft == "plugged_choke":
+            s.choke_position = 0.15
+            s.discharge_pressure += 700.0
+            s.wellhead_pressure += 120.0
+            s.flow_rate *= 0.45
+
+        elif ft == "shaft_imbalance":
+            s.shaft_health = min(s.shaft_health, 0.30)
+            s.vibration_x += 6.0
+            s.vibration_y += 5.5
+
+        elif ft == "reservoir_depletion":
+            self.reservoir_pressure = 1200.0
+            s.intake_pressure = 420.0 + float(np.random.normal(0, 15))
+            s.flow_rate *= 0.6
     
     def _apply_affinity_laws(self, frequency: float) -> Tuple[float, float, float]:
         """
@@ -423,12 +525,15 @@ class ESPSimulator:
 
         # Update equipment health
         self._update_equipment_health()
-        
+
+        # Apply active-fault effects (persistent, overrides baseline physics)
+        self._apply_active_fault_effects()
+
         # Update cumulative metrics
         self.state.runtime_hours += dt
         self.state.total_production += self.state.flow_rate * dt / 24  # barrels
         self.state.total_energy += self.state.power_consumption * dt  # kWh
-        
+
         # Update status
         self._update_status()
         

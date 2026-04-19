@@ -19,6 +19,7 @@ scipy>=1.11.0
 matplotlib>=3.7.0
 plotly>=5.18.0
 streamlit>=1.29.0
+streamlit-autorefresh>=1.0.1
 
 # Explainability
 shap>=0.43.0

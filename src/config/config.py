@@ -109,7 +109,7 @@ class TrainingConfig:
     """Training Configuration."""
     
     # General training
-    batch_size: int = 64
+    batch_size: int = 512
     epochs: int = 100
     learning_rate: float = 1e-3
     weight_decay: float = 1e-5
@@ -122,24 +122,22 @@ class TrainingConfig:
     val_split: float = 0.15
     test_split: float = 0.15
     
-    # Sensor channels
+    # Sensor channels — 11 real-deployable channels matching DHM standard sensors
+    # Removed: vibration_x/y/z, flow_rate, casing_pressure, power_factor,
+    #          wellhead_pressure, sand_rate  (not universally available on ESP DHM)
+    # Added:   vibration (scalar g), current_leakage (mA), differential_pressure (psi)
     sensor_channels: List[str] = field(default_factory=lambda: [
-        "motor_temperature",
-        "intake_pressure",
-        "discharge_pressure",
-        "motor_current",
-        "vibration_x",
-        "vibration_y",
-        "vibration_z",
-        "flow_rate",
-        "frequency",
-        "power_consumption",
-        "fluid_temperature",
-        "casing_pressure",
-        "voltage",
-        "power_factor",
-        "wellhead_pressure",
-        "sand_rate"
+        "motor_temperature",       # Motor temperature (°C)
+        "intake_pressure",         # Pump intake pressure (psi)
+        "discharge_pressure",      # Pump discharge pressure (psi)
+        "motor_current",           # Motor current draw (A)
+        "frequency",               # VSD drive frequency (Hz)
+        "fluid_temperature",       # Intake fluid temperature (°C)
+        "voltage",                 # Supply voltage (V)
+        "vibration",               # Vibration magnitude scalar (g)
+        "current_leakage",         # Active current leakage (mA) — insulation health
+        "power_consumption",       # Derived: √3 × V × I × 0.85 (kW)
+        "differential_pressure",   # Derived: discharge − intake (psi)
     ])
     
     # Anomaly detection

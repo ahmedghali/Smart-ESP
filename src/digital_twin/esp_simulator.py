@@ -41,6 +41,7 @@ class ESPState:
     vibration_x: float = 2.0  # mm/s
     vibration_y: float = 2.0  # mm/s
     vibration_z: float = 1.5  # mm/s
+    vibration: float = 3.2  # mm/s scalar (sqrt(x^2+y^2+z^2)) - matches LSTM input
     flow_rate: float = 2000.0  # bpd
     power_consumption: float = 50.0  # kW
     fluid_temperature: float = 70.0  # °C
@@ -49,6 +50,8 @@ class ESPState:
     power_factor: float = 0.85
     wellhead_pressure: float = 250.0  # psi
     sand_rate: float = 0.05  # %
+    current_leakage: float = 1.5      # mA  - insulation health indicator
+    differential_pressure: float = 1200.0  # psi - discharge minus intake
 
     # Health indicators
     equipment_health: float = 1.0  # 0-1
@@ -77,6 +80,7 @@ class ESPState:
             "vibration_x": self.vibration_x,
             "vibration_y": self.vibration_y,
             "vibration_z": self.vibration_z,
+            "vibration": self.vibration,
             "flow_rate": self.flow_rate,
             "power_consumption": self.power_consumption,
             "fluid_temperature": self.fluid_temperature,
@@ -85,6 +89,8 @@ class ESPState:
             "power_factor": self.power_factor,
             "wellhead_pressure": self.wellhead_pressure,
             "sand_rate": self.sand_rate,
+            "current_leakage": self.current_leakage,
+            "differential_pressure": self.differential_pressure,
             "equipment_health": self.equipment_health,
             "bearing_health": self.bearing_health,
             "shaft_health": self.shaft_health,
@@ -206,10 +212,36 @@ class ESPSimulator:
         self._update_status()
 
     def clear_fault(self) -> None:
-        """Clear the active fault (health damage is not reversed)."""
+        """Clear the active fault and reset sensor readings to nominal values.
+        Health damage (bearing/shaft/motor health) is intentionally preserved."""
         self.active_fault = None
         self.reservoir_pressure = 2500.0
         self.gas_oil_ratio = 150.0
+
+        # Reset sensors to nominal operating values so the UI reflects
+        # fault-cleared state immediately (next step() will continue physics).
+        s = self.state
+        s.motor_temperature = 85.0
+        s.intake_pressure   = 800.0
+        s.discharge_pressure = 2000.0
+        s.motor_current     = 45.0
+        s.vibration_x       = 2.0
+        s.vibration_y       = 2.0
+        s.vibration_z       = 1.5
+        s.sand_rate         = 0.05
+        s.voltage           = 480.0
+        s.power_factor      = 0.85
+        s.flow_rate         = 2000.0
+        s.power_consumption = 50.0
+        s.fluid_temperature = 70.0
+        s.casing_pressure   = 150.0
+        s.wellhead_pressure = 250.0
+        s.choke_position    = 0.8
+        # Derived 11-channel sensors
+        s.vibration = float(np.sqrt(s.vibration_x**2 + s.vibration_y**2 + s.vibration_z**2))
+        s.current_leakage = float(np.clip(1.5 + (1.0 - s.motor_health) * 5.0, 0, 500))
+        s.differential_pressure = float(s.discharge_pressure - s.intake_pressure)
+        self._update_status()
 
     def _apply_active_fault_effects(self) -> None:
         """
@@ -527,7 +559,29 @@ class ESPSimulator:
         self._update_equipment_health()
 
         # Apply active-fault effects (persistent, overrides baseline physics)
+        # This may modify vibration_x/y/z, discharge_pressure, motor_health, etc.
         self._apply_active_fault_effects()
+
+        # ── Derived sensors expected by AI models (11-channel input) ──
+        # Computed AFTER faults so they reflect injected anomalies.
+        self.state.vibration = float(np.sqrt(
+            self.state.vibration_x ** 2 +
+            self.state.vibration_y ** 2 +
+            self.state.vibration_z ** 2
+        ))
+        # current_leakage: healthy <5 mA, degrades inversely with motor_health.
+        # voltage_drop fault degrades motor_health indirectly.
+        self.state.current_leakage = float(np.clip(
+            1.5 + (1.0 - self.state.motor_health) * 35.0 +
+            np.abs(np.random.normal(0, 0.5)),
+            0.0, 500.0,
+        ))
+        # differential_pressure = discharge - intake (already affected by faults)
+        self.state.differential_pressure = float(np.clip(
+            self.state.discharge_pressure - self.state.intake_pressure +
+            np.random.normal(0, 5),
+            0.0, 8000.0,
+        ))
 
         # Update cumulative metrics
         self.state.runtime_hours += dt

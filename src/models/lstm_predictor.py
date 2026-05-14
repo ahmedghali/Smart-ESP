@@ -460,7 +460,6 @@ class LSTMPredictor:
             "history": self.history,
             "config": self.config
         }, path)
-        print(f"Model saved to {path}")
     
     def load(self, path: str) -> "LSTMPredictor":
         """Load model from file."""

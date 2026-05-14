@@ -111,14 +111,30 @@ class DigitalTwinEngine:
         input_dim = len(self.config.training.sensor_channels)
         
         if predictor_path and Path(predictor_path).exists():
-            self.predictor = LSTMPredictor(input_dim=input_dim, config=self.config)
-            self.predictor.load(predictor_path)
-            print(f"Loaded predictor from {predictor_path}")
+            # Peek at checkpoint to extract saved config — handles finetuned
+            # (hidden=32, 1 layer) vs pretrained (hidden=256, 3 layers) shape mismatch.
+            raw = torch.load(predictor_path, map_location=self.device,
+                             weights_only=False)
+            saved_config = raw.get("config", self.config)
+            self.predictor = LSTMPredictor(input_dim=input_dim, config=saved_config)
+            self.predictor.model.load_state_dict(raw["model_state_dict"])
+            self.predictor.history = raw.get("history", {})
+            print(f"Loaded predictor from {predictor_path} "
+                  f"(hidden={saved_config.model.lstm_hidden_size}, "
+                  f"layers={saved_config.model.lstm_num_layers})")
         
         if anomaly_path and Path(anomaly_path).exists():
-            self.anomaly_detector = AnomalyDetector(input_dim=input_dim, config=self.config)
-            self.anomaly_detector.load(anomaly_path)
-            print(f"Loaded anomaly detector from {anomaly_path}")
+            # Infer input_dim from encoder LSTM weights to handle checkpoint shape mismatches.
+            ae_ckpt = torch.load(anomaly_path, map_location=self.device,
+                                 weights_only=False)
+            ae_sd = ae_ckpt["model_state_dict"]
+            # encoder.lstm.weight_ih_l0: shape [4*hidden, input_dim]
+            ae_in = ae_sd["encoder.lstm.weight_ih_l0"].shape[1]
+            self.anomaly_detector = AnomalyDetector(input_dim=ae_in, config=self.config)
+            self.anomaly_detector.model.load_state_dict(ae_sd)
+            self.anomaly_detector.threshold = ae_ckpt.get("threshold", 1.0)
+            self.anomaly_detector.history   = ae_ckpt.get("history", {})
+            print(f"Loaded anomaly detector from {anomaly_path} (input_dim={ae_in})")
         
         if optimizer_path and Path(optimizer_path).exists():
             self.optimizer = DRLOptimizer(config=self.config)
@@ -126,10 +142,17 @@ class DigitalTwinEngine:
             print(f"Loaded optimizer from {optimizer_path}")
         
         if pinn_path and Path(pinn_path).exists():
-            self.pinn = PINN(input_dim=input_dim, output_dim=4)
-            checkpoint = torch.load(pinn_path, map_location=self.device)
-            self.pinn.load_state_dict(checkpoint["model_state_dict"])
-            print(f"Loaded PINN from {pinn_path}")
+            # Infer input_dim and output_dim from checkpoint weights to avoid
+            # shape mismatch when the saved model differs from current defaults.
+            pinn_ckpt = torch.load(pinn_path, map_location=self.device,
+                                   weights_only=False)
+            sd = pinn_ckpt["model_state_dict"]
+            pinn_in  = sd["hidden_layers.0.linear.weight"].shape[1]
+            pinn_out = sd["output_layer.weight"].shape[0]
+            self.pinn = PINN(input_dim=pinn_in, output_dim=pinn_out)
+            self.pinn.load_state_dict(sd)
+            print(f"Loaded PINN from {pinn_path} "
+                  f"(input_dim={pinn_in}, output_dim={pinn_out})")
     
     def sync_state(self, sensor_data: Dict[str, float]) -> ESPState:
         """
@@ -283,9 +306,24 @@ class DigitalTwinEngine:
             )
             new_alerts.append(alert)
 
-        self.alert_history.extend(new_alerts)
-        return new_alerts
-    
+        # Deduplicate: skip new alerts that are identical to one fired in the
+        # last DEDUP_WINDOW seconds (same sensor + same level). Prevents the
+        # log from spamming the same "Motor CRITICAL: 142.x" every step.
+        DEDUP_WINDOW_S = 30.0
+        from datetime import timedelta
+        dedup_cutoff = now - timedelta(seconds=DEDUP_WINDOW_S)
+        recent = [a for a in self.alert_history if a.timestamp >= dedup_cutoff]
+        deduped = []
+        for a in new_alerts:
+            already_fired = any(
+                r.sensor == a.sensor and r.level == a.level for r in recent
+            )
+            if not already_fired:
+                deduped.append(a)
+
+        self.alert_history.extend(deduped)
+        return deduped
+
     def predict_failure(
         self,
         horizon_hours: int = 48

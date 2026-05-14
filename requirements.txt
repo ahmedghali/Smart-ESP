@@ -1,7 +1,7 @@
 # ESP AI Optimization - Requirements
-# Note: Uses PyTorch as primary framework
+# Note: Uses PyTorch CPU-only (Streamlit Cloud has no GPU)
 
-# Deep Learning (PyTorch)
+# Deep Learning (PyTorch - CPU)
 torch>=2.0.0
 torchvision>=0.15.0
 
@@ -28,12 +28,3 @@ shap>=0.43.0
 tqdm>=4.65.0
 pyyaml>=6.0
 python-dateutil>=2.8.0
-
-# Testing
-pytest>=7.4.0
-pytest-cov>=4.1.0
-
-# Optional (install separately with Python <= 3.12):
-# pip install tensorflow>=2.15.0
-# pip install deepxde>=1.10.0
-# pip install lime>=0.2.0

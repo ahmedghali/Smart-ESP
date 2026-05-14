@@ -49,14 +49,15 @@ class ESPEnvironment(gym.Env):
         self.esp = self.config.esp
         self.render_mode = render_mode
         
-        # State space: sensor readings + equipment health
-        # [temp, intake_p, discharge_p, current, vib_x, vib_y, vib_z,
-        #  flow, freq, power, fluid_temp, casing_p, voltage, power_factor,
-        #  wellhead_p, sand_rate, health_score, production_target]
+        # State space: 11 real sensor channels + equipment_health + production_target = 13
+        # [motor_temp, intake_p, discharge_p, current, freq, fluid_temp,
+        #  voltage, vibration, current_leakage, power_consumption,
+        #  differential_pressure, health_score, production_target]
+        self.n_sensors = len(self.config.training.sensor_channels)
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(18,),
+            shape=(self.n_sensors + 2,),
             dtype=np.float32
         )
         
@@ -97,48 +98,34 @@ class ESPEnvironment(gym.Env):
         discharge_pressure = 2000 * (freq_ratio ** 2) + np.random.normal(0, 20)
         motor_current = 40 * freq_ratio + np.random.normal(0, 1)
         
-        vibration_base = 2.0 * (1 + (1 - self.equipment_health) * 3)
-        vibration_x = vibration_base + np.abs(np.random.normal(0, 0.3))
-        vibration_y = vibration_base + np.abs(np.random.normal(0, 0.3))
-        vibration_z = vibration_base + np.abs(np.random.normal(0, 0.2))
-        
-        # Flow rate based on affinity law and choke
-        base_flow = 2000 * freq_ratio * self.choke_position
-        flow_rate = base_flow + np.random.normal(0, 30)
-        
-        power = 50 * (freq_ratio ** 3) + np.random.normal(0, 1)
-        fluid_temp = 70 + np.random.normal(0, 1)
-        casing_pressure = 150 + np.random.normal(0, 5)
+        # Vibration scalar (g) — increases with equipment degradation
+        vibration = 0.15 * (1 + (1 - self.equipment_health) * 5) + np.abs(np.random.normal(0, 0.02))
 
-        # New sensors
+        fluid_temp = 70 + np.random.normal(0, 1)
         voltage = self.esp.nominal_voltage - 2 * freq_ratio + np.random.normal(0, 2)
-        power_factor = np.clip(
-            self.esp.nominal_power_factor - 0.05 * (1 - freq_ratio) + np.random.normal(0, 0.01),
-            self.esp.min_power_factor, self.esp.max_power_factor
-        )
-        wellhead_pressure = np.clip(
-            250 - 30 * freq_ratio + np.random.normal(0, 5),
-            self.esp.min_wellhead_pressure, self.esp.max_wellhead_pressure
-        )
-        sand_rate = max(0, self.esp.normal_sand_rate + abs(np.random.normal(0, 0.01)))
+
+        # Power consumption (kW) — derived: √3 × V × I × 0.85
+        power = np.sqrt(3) * voltage * motor_current * 0.85 / 1000.0 + np.random.normal(0, 0.5)
+        power = max(0.0, power)
+
+        # Differential pressure (psi)
+        differential_pressure = discharge_pressure - intake_pressure + np.random.normal(0, 5)
+
+        # Current leakage (mA) — rises as insulation degrades
+        current_leakage = max(0.0, 1.5 + (1 - self.equipment_health) * 20 + np.random.normal(0, 0.3))
 
         obs = np.array([
             motor_temp,
             intake_pressure,
             discharge_pressure,
             motor_current,
-            vibration_x,
-            vibration_y,
-            vibration_z,
-            flow_rate,
             self.frequency,
-            power,
             fluid_temp,
-            casing_pressure,
             voltage,
-            power_factor,
-            wellhead_pressure,
-            sand_rate,
+            vibration,
+            current_leakage,
+            power,
+            differential_pressure,
             self.equipment_health,
             self.target_production
         ], dtype=np.float32)
@@ -159,67 +146,79 @@ class ESPEnvironment(gym.Env):
         - Preserve equipment health
         - Avoid constraint violations
         """
-        flow_rate = obs[7]
-        power = obs[9]
-        motor_temp = obs[0]
-        vibration_mag = np.sqrt(obs[4]**2 + obs[5]**2 + obs[6]**2)
-        sand_rate = obs[15]
-        
-        # Production reward (meeting target)
-        production_fraction = min(flow_rate / self.target_production, 1.5)
-        if production_fraction < 0.8:
-            production_reward = -2.0 * (0.8 - production_fraction)
-        elif production_fraction < 1.0:
-            production_reward = 0.5 * production_fraction
+        # obs indices: [motor_temp(0), intake_p(1), discharge_p(2), current(3),
+        #               freq(4), fluid_temp(5), voltage(6), vibration(7),
+        #               current_leakage(8), power(9), diff_pressure(10),
+        #               health(11), prod_target(12)]
+        motor_temp       = obs[0]
+        power            = obs[9]
+        diff_pressure    = obs[10]
+        vibration        = obs[7]
+        current_leakage  = obs[8]
+
+        # ── Production reward (dominant signal) ──────────────────────────────
+        # Differential pressure as production proxy (1000–3000 psi = healthy range).
+        # Weight ×3 vs previous version so production drives policy, not health.
+        prod_fraction = np.clip(diff_pressure / 2000.0, 0.0, 1.5)
+        if prod_fraction < 0.5:
+            production_reward = -6.0 * (0.5 - prod_fraction)   # steep penalty near zero
+        elif prod_fraction < 1.0:
+            production_reward = 1.5 * prod_fraction             # was 0.5
         else:
-            production_reward = 1.0 * min(production_fraction, 1.2)
-        
-        # Energy efficiency reward
-        if flow_rate > 0:
-            energy_per_barrel = (power * 24) / flow_rate  # kWh per barrel
-            efficiency_ratio = self.baseline_energy_per_barrel / max(energy_per_barrel, 0.1)
-            energy_reward = 0.5 * (efficiency_ratio - 1.0)  # Reward for being better than baseline
+            production_reward = 1.5 * min(prod_fraction, 1.2)  # was 1.0
+
+        # Hard minimum-production constraint: if virtually no pressure, penalise hard.
+        # Prevents the agent from idling at low frequency to protect health.
+        if prod_fraction < 0.4:
+            constraint_penalty_prod = -4.0
         else:
-            energy_reward = -1.0
-        
-        # Equipment health reward
-        health_reward = 0.3 * self.equipment_health
-        
-        # Constraint violation penalties
-        constraint_penalty = 0.0
-        
+            constraint_penalty_prod = 0.0
+
+        # ── Energy efficiency reward ──────────────────────────────────────────
+        energy_per_unit  = power / max(diff_pressure, 1.0)
+        baseline_ratio   = 0.02  # kW/psi baseline
+        efficiency_ratio = baseline_ratio / max(energy_per_unit, 1e-6)
+        energy_reward    = 0.5 * (efficiency_ratio - 1.0)
+
+        # ── Equipment health reward (reduced — health matters, but less than production) ──
+        # Was 0.3 → now 0.1 so 720-step total health signal < production signal.
+        health_reward = 0.1 * self.equipment_health
+
+        # ── Constraint violation penalties ────────────────────────────────────
+        constraint_penalty = constraint_penalty_prod
+
         # Temperature constraint
         if motor_temp > self.esp.critical_temp:
             constraint_penalty -= 5.0 * (motor_temp - self.esp.critical_temp) / 10
-        
-        # Vibration constraint
-        if vibration_mag > self.esp.critical_vibration:
-            constraint_penalty -= 3.0 * (vibration_mag - self.esp.critical_vibration) / 5
-        
+
+        # Vibration constraint (g scale: warning ~0.5g, critical ~1.0g)
+        if vibration > 0.8:
+            constraint_penalty -= 3.0 * (vibration - 0.8) / 0.2
+
+        # Insulation constraint (leakage > 50 mA = danger)
+        if current_leakage > 50:
+            constraint_penalty -= 2.0 * (current_leakage - 50) / 50
+
         # Frequency bounds
         if self.frequency < self.esp.min_frequency_hz or self.frequency > self.esp.max_frequency_hz:
             constraint_penalty -= 10.0
 
-        # Sand rate constraint
-        if sand_rate > self.esp.critical_sand_rate:
-            constraint_penalty -= 2.0 * (sand_rate - self.esp.critical_sand_rate)
-        
-        # Total reward
+        # ── Total reward ──────────────────────────────────────────────────────
         total_reward = (
             production_reward +
             energy_reward +
             health_reward +
             constraint_penalty
         )
-        
+
         info = {
-            "production_reward": production_reward,
-            "energy_reward": energy_reward,
-            "health_reward": health_reward,
+            "production_reward":  production_reward,
+            "energy_reward":      energy_reward,
+            "health_reward":      health_reward,
             "constraint_penalty": constraint_penalty,
-            "flow_rate": flow_rate,
-            "power": power,
-            "efficiency": energy_per_barrel if flow_rate > 0 else float('inf')
+            "diff_pressure":      diff_pressure,
+            "power":              power,
+            "efficiency":         energy_per_unit,
         }
         
         return total_reward, info
@@ -254,9 +253,12 @@ class ESPEnvironment(gym.Env):
         reward, info = self._calculate_reward(obs, action)
         
         # Track cumulative metrics
-        flow_rate = obs[7]
+        # obs[7] = vibration (NOT flow_rate). Use frequency-based production estimate.
+        # Affinity law: flow ∝ frequency → estimate bpd proportional to freq ratio.
+        freq_ratio = self.frequency / self.esp.nominal_frequency_hz
+        est_flow_bpd = self.target_production * freq_ratio
         power = obs[9]
-        self.cumulative_production += flow_rate / 24  # hourly contribution
+        self.cumulative_production += est_flow_bpd / 24  # hourly bbl contribution
         self.cumulative_energy += power
         
         self.current_step += 1
@@ -271,7 +273,8 @@ class ESPEnvironment(gym.Env):
             "choke_position": self.choke_position,
             "equipment_health": self.equipment_health,
             "cumulative_production": self.cumulative_production,
-            "cumulative_energy": self.cumulative_energy
+            "cumulative_energy": self.cumulative_energy,
+            "est_flow_bpd": est_flow_bpd,
         })
         
         return obs, reward, terminated, truncated, info
@@ -312,32 +315,56 @@ class ESPEnvironment(gym.Env):
 class DRLOptimizer:
     """
     Deep Reinforcement Learning optimizer for ESP systems.
-    
-    Uses PPO algorithm from Stable Baselines3 for training.
+
+    Supports PPO (default) and SAC algorithms from Stable Baselines3.
+    Automatically wraps the environment with VecNormalize for observation
+    and reward normalization (Engstrom et al. ICLR 2020).
     """
-    
+
     def __init__(
         self,
         config: Optional[Config] = None,
-        device: Optional[str] = None
+        device: Optional[str] = None,
+        algo: str = "sac",                  # "sac" (default, +30-50% reward) or "ppo"
+        use_vec_normalize: bool = True,     # observation+reward normalization
     ):
         """
         Initialize optimizer.
-        
+
         Args:
             config: Configuration object
             device: Device to use
+            algo: Algorithm to use ("sac" or "ppo"). SAC is better for continuous control.
+            use_vec_normalize: Wrap env with VecNormalize (recommended).
         """
         self.config = config or Config()
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        
-        self.env = None
+        self.algo = algo.lower()
+        self.use_vec_normalize = use_vec_normalize
+
+        if self.algo not in ("sac", "ppo"):
+            raise ValueError(f"algo must be 'sac' or 'ppo', got: {algo}")
+
+        self.env = None         # VecEnv (possibly wrapped)
+        self.raw_env = None     # Underlying ESPEnvironment (for direct access)
         self.model = None
         self.training_stats: List[Dict] = []
-    
-    def create_environment(self) -> ESPEnvironment:
-        """Create and return the ESP environment."""
-        self.env = ESPEnvironment(config=self.config)
+
+    def create_environment(self):
+        """Create the ESP environment, optionally wrapped with VecNormalize."""
+        from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+
+        self.raw_env = ESPEnvironment(config=self.config)
+
+        # Wrap into a single-env VecEnv (required by SB3)
+        env = DummyVecEnv([lambda: self.raw_env])
+
+        if self.use_vec_normalize:
+            # Normalise observations (running mean/std) + rewards (gamma=0.99)
+            env = VecNormalize(env, norm_obs=True, norm_reward=True, gamma=0.99)
+            print("  Env wrapped with VecNormalize (obs + reward normalization)")
+
+        self.env = env
         return self.env
     
     def train(
@@ -346,48 +373,71 @@ class DRLOptimizer:
         save_path: Optional[str] = None
     ) -> None:
         """
-        Train the DRL agent.
-        
+        Train the DRL agent (SAC or PPO based on self.algo).
+
         Args:
             total_timesteps: Total training timesteps
             save_path: Path to save trained model
         """
         try:
-            from stable_baselines3 import PPO
-            from stable_baselines3.common.callbacks import EvalCallback
-            from stable_baselines3.common.env_util import make_vec_env
+            from stable_baselines3 import PPO, SAC
         except ImportError:
             print("stable-baselines3 not installed. Please run: pip install stable-baselines3")
             return
-        
+
         if self.env is None:
             self.create_environment()
-        
-        print(f"Training DRL Optimizer for {total_timesteps} timesteps")
-        
-        # Create model
-        self.model = PPO(
-            policy=self.config.model.drl_policy,
-            env=self.env,
-            learning_rate=self.config.model.drl_learning_rate,
-            n_steps=self.config.model.drl_n_steps,
-            batch_size=self.config.model.drl_batch_size,
-            n_epochs=self.config.model.drl_n_epochs,
-            gamma=self.config.model.drl_gamma,
-            gae_lambda=self.config.model.drl_gae_lambda,
-            clip_range=self.config.model.drl_clip_range,
-            verbose=1,
-            device=self.device
-        )
-        
+
+        print(f"Training DRL Optimizer [{self.algo.upper()}] "
+              f"for {total_timesteps} timesteps")
+
+        # Create model based on algorithm
+        if self.algo == "sac":
+            # SAC: off-policy, entropy-regularized, sample-efficient for continuous control
+            # Haarnoja et al. 2018 (arXiv:1801.01290)
+            self.model = SAC(
+                policy="MlpPolicy",
+                env=self.env,
+                learning_rate=self.config.model.drl_learning_rate,
+                batch_size=256,                 # SAC default
+                buffer_size=100_000,            # Replay buffer
+                learning_starts=1000,           # Warm-up
+                tau=0.005,                      # Soft target update
+                gamma=self.config.model.drl_gamma,
+                train_freq=1,
+                gradient_steps=1,
+                ent_coef="auto",                # Auto-adjust entropy coefficient
+                verbose=1,
+                device=self.device,
+            )
+        else:  # ppo
+            self.model = PPO(
+                policy=self.config.model.drl_policy,
+                env=self.env,
+                learning_rate=self.config.model.drl_learning_rate,
+                n_steps=self.config.model.drl_n_steps,
+                batch_size=self.config.model.drl_batch_size,
+                n_epochs=self.config.model.drl_n_epochs,
+                gamma=self.config.model.drl_gamma,
+                gae_lambda=self.config.model.drl_gae_lambda,
+                clip_range=self.config.model.drl_clip_range,
+                verbose=1,
+                device=self.device,
+            )
+
         # Train
         self.model.learn(total_timesteps=total_timesteps)
-        
-        # Save model
+
+        # Save model + VecNormalize stats (so we can normalise obs at inference)
         if save_path:
             Path(save_path).parent.mkdir(parents=True, exist_ok=True)
             self.model.save(save_path)
             print(f"Model saved to {save_path}")
+
+            if self.use_vec_normalize:
+                vn_path = Path(save_path).with_suffix(".vecnorm.pkl")
+                self.env.save(str(vn_path))
+                print(f"VecNormalize stats saved to {vn_path}")
     
     def evaluate(
         self,
@@ -404,29 +454,37 @@ class DRLOptimizer:
         """
         if self.model is None:
             raise RuntimeError("Model not trained. Call train() first.")
-        
+
         if self.env is None:
             self.create_environment()
-        
+
         total_rewards = []
         total_production = []
         total_energy = []
-        
+
+        # Use raw_env for evaluation (Gymnasium API), apply normalize_obs manually.
+        # VecNormalize is for training-time observation/reward normalisation,
+        # at eval time we want the *true* rewards reported.
+        def _normalise(obs):
+            if self.use_vec_normalize and hasattr(self.env, "normalize_obs"):
+                return self.env.normalize_obs(obs)
+            return obs
+
         for _ in range(n_episodes):
-            obs, _ = self.env.reset()
+            obs, _ = self.raw_env.reset()
             episode_reward = 0
             done = False
-            
+
             while not done:
-                action, _ = self.model.predict(obs, deterministic=True)
-                obs, reward, terminated, truncated, info = self.env.step(action)
+                action, _ = self.model.predict(_normalise(obs), deterministic=True)
+                obs, reward, terminated, truncated, info = self.raw_env.step(action)
                 episode_reward += reward
                 done = terminated or truncated
-            
+
             total_rewards.append(episode_reward)
             total_production.append(info["cumulative_production"])
             total_energy.append(info["cumulative_energy"])
-        
+
         metrics = {
             "mean_reward": np.mean(total_rewards),
             "std_reward": np.std(total_rewards),
@@ -434,19 +492,40 @@ class DRLOptimizer:
             "mean_energy": np.mean(total_energy),
             "energy_per_barrel": np.mean(total_energy) / (np.mean(total_production) + 1e-6)
         }
-        
+
         baseline_energy_per_barrel = 15.0
         metrics["energy_savings_pct"] = (
-            (baseline_energy_per_barrel - metrics["energy_per_barrel"]) / 
+            (baseline_energy_per_barrel - metrics["energy_per_barrel"]) /
             baseline_energy_per_barrel * 100
         )
-        
+
+        # --- Baseline aléatoire pour mesurer le gain réel de l'agent ---
+        random_rewards = []
+        for _ in range(n_episodes):
+            obs, _ = self.raw_env.reset()
+            ep_reward = 0.0
+            done = False
+            while not done:
+                action = self.raw_env.action_space.sample()   # agent aléatoire
+                obs, reward, terminated, truncated, info = self.raw_env.step(action)
+                ep_reward += reward
+                done = terminated or truncated
+            random_rewards.append(ep_reward)
+
+        metrics["random_mean_reward"]  = float(np.mean(random_rewards))
+        metrics["reward_vs_random_pct"] = float(
+            (metrics["mean_reward"] - metrics["random_mean_reward"]) /
+            (abs(metrics["random_mean_reward"]) + 1e-6) * 100
+        )
+
         print("\nEvaluation Results:")
-        print(f"  Mean Reward: {metrics['mean_reward']:.2f} ± {metrics['std_reward']:.2f}")
-        print(f"  Mean Production: {metrics['mean_production']:.0f} barrels")
-        print(f"  Energy per Barrel: {metrics['energy_per_barrel']:.2f} kWh")
-        print(f"  Energy Savings: {metrics['energy_savings_pct']:.1f}%")
-        
+        print(f"  Mean Reward (agent)  : {metrics['mean_reward']:.2f} ± {metrics['std_reward']:.2f}")
+        print(f"  Mean Reward (random) : {metrics['random_mean_reward']:.2f}")
+        print(f"  Gain vs random       : {metrics['reward_vs_random_pct']:+.1f}%")
+        print(f"  Mean Production      : {metrics['mean_production']:.0f} barrels")
+        print(f"  Energy per Barrel    : {metrics['energy_per_barrel']:.2f} kWh")
+        print(f"  Energy Savings       : {metrics['energy_savings_pct']:.1f}% vs fixed baseline")
+
         return metrics
     
     def get_action(
@@ -466,23 +545,83 @@ class DRLOptimizer:
         """
         if self.model is None:
             raise RuntimeError("Model not trained. Call train() first.")
-        
+
+        # Normalize observation using VecNormalize stats if active.
+        # Skip if the saved stats have a different obs dimension than the
+        # current observation (e.g. model trained with old 16-channel config).
+        if self.use_vec_normalize and hasattr(self.env, "normalize_obs"):
+            try:
+                expected_dim = self.env.obs_rms.mean.shape[0]
+                if observation.shape[0] != expected_dim:
+                    print(f"[DRL] VecNormalize shape mismatch "
+                          f"({observation.shape[0]} vs {expected_dim}) — "
+                          f"skipping normalization.")
+                else:
+                    observation = self.env.normalize_obs(observation)
+            except Exception:
+                pass  # skip normalization on any error
+
+        # Guard against policy obs-space mismatch (e.g. model trained with
+        # old 18-D obs but current env has 13-D obs).
+        try:
+            policy_obs_dim = self.model.observation_space.shape[0]
+        except Exception:
+            policy_obs_dim = observation.shape[0]
+
+        if observation.shape[0] != policy_obs_dim:
+            print(f"[DRL] Policy obs-space mismatch "
+                  f"({observation.shape[0]} vs {policy_obs_dim}) — "
+                  f"returning neutral action.")
+            # Return the midpoint of the action space as a safe default
+            action = np.array(
+                [(self.model.action_space.low[i] + self.model.action_space.high[i]) / 2.0
+                 for i in range(self.model.action_space.shape[0])],
+                dtype=np.float32,
+            )
+            return action
+
         action, _ = self.model.predict(observation, deterministic=deterministic)
         return action
-    
+
     def load(self, path: str) -> "DRLOptimizer":
-        """Load trained model."""
+        """Load trained model (auto-detects SAC vs PPO from saved file)."""
         try:
-            from stable_baselines3 import PPO
+            from stable_baselines3 import PPO, SAC
+            from stable_baselines3.common.vec_env import VecNormalize
         except ImportError:
             print("stable-baselines3 not installed.")
             return self
-        
+
         if self.env is None:
             self.create_environment()
-        
-        self.model = PPO.load(path, env=self.env, device=self.device)
-        print(f"Model loaded from {path}")
+
+        # Load VecNormalize stats first (must match env wrapping at training)
+        if self.use_vec_normalize:
+            vn_path = Path(path).with_suffix(".vecnorm.pkl")
+            if vn_path.exists():
+                # Re-wrap with the saved stats
+                from stable_baselines3.common.vec_env import DummyVecEnv
+                self.raw_env = ESPEnvironment(config=self.config)
+                base_env = DummyVecEnv([lambda: self.raw_env])
+                self.env = VecNormalize.load(str(vn_path), base_env)
+                self.env.training = False     # freeze stats at inference
+                self.env.norm_reward = False  # don't normalise reward at inference
+                print(f"VecNormalize stats loaded from {vn_path}")
+            else:
+                # Old model trained without VecNormalize -> disable for inference
+                print(f"  [INFO] No VecNormalize file at {vn_path}, disabling normalization")
+                self.use_vec_normalize = False
+
+        # Try SAC first, fallback to PPO (zip file format differs)
+        algo_cls = SAC if self.algo == "sac" else PPO
+        try:
+            self.model = algo_cls.load(path, env=self.env, device=self.device)
+        except Exception as e:
+            print(f"  Loading as {self.algo.upper()} failed ({e}), trying the other algo...")
+            other_cls = PPO if self.algo == "sac" else SAC
+            self.model = other_cls.load(path, env=self.env, device=self.device)
+            self.algo = "ppo" if other_cls is PPO else "sac"
+        print(f"Model loaded from {path} as {self.algo.upper()}")
         return self
 
 

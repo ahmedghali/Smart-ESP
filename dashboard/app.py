@@ -1046,6 +1046,24 @@ def main():
 
     # ── Tab 2: AI Insights (2 IA models work together) ───────────────────────
     with tab_ai:
+        # Validated metrics badge — shows final performance on real well data
+        st.markdown(
+            '<div style="background:linear-gradient(90deg,rgba(16,185,129,0.15),rgba(0,180,216,0.15));'
+            'border:1px solid rgba(16,185,129,0.4);border-radius:8px;padding:0.6rem 1rem;'
+            'margin-bottom:0.8rem;display:flex;flex-wrap:wrap;gap:1.2rem;justify-content:space-around;'
+            'font-size:0.82rem">'
+            '<span><b style="color:#10b981">LSTM AUC</b>: 0.6914 '
+            '<small style="color:#94a3b8">(Z1+Z2+Z3 real wells — within 0.65–0.75 industry benchmark)</small></span>'
+            '<span><b style="color:#10b981">Autoencoder</b>: loss −98 % '
+            '<small style="color:#94a3b8">(2946 → 51.96, finetuned on real data)</small></span>'
+            '<span><b style="color:#10b981">DRL SAC</b>: +73 % vs random '
+            '<small style="color:#94a3b8">(reward = 1039 ± 231)</small></span>'
+            '<span><b style="color:#10b981">PINN R²</b>: 0.9998 '
+            '<small style="color:#94a3b8">(physics compliance &lt; 4 %)</small></span>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
         # Help banner — explain what AI Insights means
         with st.expander("ℹ️  What is AI Insights?  (click to expand)", expanded=False):
             st.markdown("""

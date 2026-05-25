@@ -1,11 +1,11 @@
-# ESP AI Optimization - Requirements
-# Note: Uses PyTorch CPU-only (Streamlit Cloud has no GPU)
+# ESP AI Optimization — Requirements
+# Targets Python 3.11. Streamlit Cloud has no GPU, so PyTorch CPU is used in deployment.
 
-# Deep Learning (PyTorch - CPU)
+# Deep Learning (PyTorch — CPU on Streamlit Cloud, CUDA locally on RTX 4060)
 torch>=2.0.0
 torchvision>=0.15.0
 
-# Reinforcement Learning
+# Reinforcement Learning (SAC + VecNormalize)
 stable-baselines3>=2.0.0
 gymnasium>=0.29.0
 
@@ -14,8 +14,9 @@ pandas>=2.0.0
 numpy>=1.24.0
 scikit-learn>=1.3.0
 scipy>=1.11.0
+openpyxl>=3.1.0           # required by pandas.read_excel for Z1/Z2/Z3 .xlsx files
 
-# Visualization
+# Visualization & Dashboard
 matplotlib>=3.7.0
 plotly>=5.18.0
 streamlit>=1.29.0

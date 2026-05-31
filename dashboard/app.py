@@ -1053,7 +1053,7 @@ def main():
             'margin-bottom:0.8rem;display:flex;flex-wrap:wrap;gap:1.2rem;justify-content:space-around;'
             'font-size:0.82rem">'
             '<span><b style="color:#10b981">LSTM AUC</b>: 0.6914 '
-            '<small style="color:#94a3b8">(Z1+Z2+Z3 real wells — within 0.65–0.75 industry benchmark)</small></span>'
+            '<small style="color:#94a3b8">(3 real wells, Iraq &amp; Egypt — within 0.65–0.75 industry benchmark)</small></span>'
             '<span><b style="color:#10b981">Autoencoder</b>: loss −98 % '
             '<small style="color:#94a3b8">(2946 → 51.96, finetuned on real data)</small></span>'
             '<span><b style="color:#10b981">DRL SAC</b>: +73 % vs random '
